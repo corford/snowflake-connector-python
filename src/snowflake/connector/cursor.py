@@ -14,6 +14,9 @@ from logging import getLogger
 from threading import Lock, Timer
 from typing import IO, TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+from snowflake.connector.result_chunk import create_chunks_from_response
+from snowflake.connector.result_set import ResultSet, ResultSetInterface
+
 from .bind_upload_agent import BindUploadAgent, BindUploadError
 from .compat import BASE_EXCEPTION_CLASS
 from .constants import (
@@ -57,7 +60,7 @@ except ImportError:
     pyarrow = None
 
 try:
-    from .arrow_result import ArrowResult
+    from .arrow_iterator import PyArrowIterator  # NOQA
 
     CAN_USE_ARROW_RESULT = True
 except ImportError as e:  # pragma: no cover
@@ -177,7 +180,7 @@ class SnowflakeCursor(object):
         self._time_output_format = None
         self._timezone = None
         self._binary_output_format = None
-        self._result = None
+        self._result: Optional["ResultSetInterface"] = None
         self._use_dict_result = use_dict_result
         self._json_result_class = json_result_class
 
@@ -736,13 +739,17 @@ class SnowflakeCursor(object):
                 )
             )
 
-        if self._query_result_format == "arrow":
-            self.check_can_use_arrow_resultset()
-            self._result = ArrowResult(
-                data, self, use_dict_result=self._use_dict_result
+        result_chunks = create_chunks_from_response(
+            self,
+            self._query_result_format,
+            data,
+        )
+        self._result = iter(
+            ResultSet(
+                self,
+                result_chunks,
             )
-        else:
-            self._result = self._json_result_class(data, self)
+        )
 
         if is_dml:
             updated_rows = 0
@@ -1020,7 +1027,7 @@ class SnowflakeCursor(object):
         """Resets the result set."""
         self._total_rowcount = -1  # reset the rowcount
         if self._result is not None:
-            self._result._reset()
+            self._result = None
         if self._inner_cursor is not None:
             self._inner_cursor.reset()
             self._result = None

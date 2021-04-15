@@ -7,11 +7,16 @@ from itertools import chain
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional
 
+from snowflake.connector.options import installed_pandas
 from snowflake.connector.result_chunk import DownloadMetrics, ResultChunk
 from snowflake.connector.telemetry import TelemetryField
+from snowflake.connector.time_util import get_time_millis
 
 if TYPE_CHECKING:  # pragma: no cover
     from snowflake.connector.cursor import SnowflakeCursor
+
+if installed_pandas:
+    from pyarrow import concat_tables
 
 logger = getLogger(__name__)
 
@@ -28,23 +33,58 @@ class ResultSetInterface(ABC, Iterable[List[Any]]):
         self._iter: Optional[Iterator[List[Any]]] = None
 
     def _report_metrics(self) -> None:
-        """Report all metrics totalled up."""
-        # TODO report first chunk telemetry and maybe there's a few other kinds
-        #  of telemetry missing still
+        """Report all metrics totalled up.
+
+        This includes TIME_CONSUME_LAST_RESULT, TIME_DOWNLOADING_CHUNKS and
+        TIME_PARSING_CHUNKS in that order.
+        """
+        time_consume_last_result = get_time_millis() - self._cursor._first_chunk_time
         self._cursor._log_telemetry_job_data(
-            TelemetryField.TIME_DOWNLOADING_CHUNKS,
-            self._metrics[DownloadMetrics.download.value],
+            TelemetryField.TIME_CONSUME_LAST_RESULT, time_consume_last_result
         )
-        self._cursor._log_telemetry_job_data(
-            TelemetryField.TIME_PARSING_CHUNKS,
-            self._metrics[DownloadMetrics.parse.value],
-        )
+        metrics = self._get_metrics()
+        if DownloadMetrics.download.value in metrics:
+            self._cursor._log_telemetry_job_data(
+                TelemetryField.TIME_DOWNLOADING_CHUNKS,
+                metrics.get(DownloadMetrics.download.value),
+            )
+        if DownloadMetrics.parse.value in metrics:
+            self._cursor._log_telemetry_job_data(
+                TelemetryField.TIME_PARSING_CHUNKS,
+                metrics.get(DownloadMetrics.parse.value),
+            )
+
+    def _fetch_arrow_batches(self):
+        # TODO test for not Arrow Chunks here for these functions
+        pass
+
+    def _fetch_arrow_all(self):
+        """Fetches a single Arrow Table."""
+        tables = list(self._fetch_arrow_batches())
+        if tables:
+            return concat_tables(tables)
+        else:
+            return None
+
+    def _fetch_pandas_batches(self, **kwargs):
+        """Fetches Pandas dataframes in batch, where 'batch' refers to Snowflake Chunk. Thus, the batch size (the
+        number of rows in dataframe) is optimized by Snowflake Python Connector."""
+        for table in self._fetch_arrow_batches():
+            yield table.to_pandas(**kwargs)
+
+    def _fetch_pandas_all(self, **kwargs):
+        """Fetches a single Pandas dataframe."""
+        table = self._fetch_arrow_all()
+        if table:
+            return table.to_pandas(**kwargs)
+        else:
+
+            return pandas.DataFrame(columns=self._column_idx_to_name)
 
     def _pre_download(self) -> None:
         """Pre-download some chunks at creation time."""
 
-    @property
-    def _metrics(self):
+    def _get_metrics(self) -> Dict[str, int]:
         """Sum up all the chunks' metrics and show them together."""
         overall_metrics: Dict[str, int] = {}
         for c in self.partitions:
@@ -62,6 +102,7 @@ class ResultSetInterface(ABC, Iterable[List[Any]]):
             return next(self._iter)
         except StopIteration:
             self._report_metrics()
+            raise
 
 
 class ResultSet(ResultSetInterface):
@@ -71,7 +112,6 @@ class ResultSet(ResultSetInterface):
     as that is embedded in the response JSON from Snowflake).
     """
 
-    @abstractmethod
     def __iter__(self) -> Iterator[List[Any]]:
         """Set up a new iterator through all partitions with first 5 chunks ready."""
         with ThreadPoolExecutor(4) as pool:
@@ -93,5 +133,11 @@ class NoPrefetchResultSet(ResultSetInterface):
     It pre-downloads none of the chunks at creation time.
     """
 
-    def _pre_download(self) -> None:
-        pass
+    def __iter__(self) -> Iterator[List[Any]]:
+        """Set up a new iterator through all partitions with first 5 chunks ready."""
+
+        # TODO find a better way than keeping an internal iterator
+        self._iter = chain.from_iterable(
+            self.partitions,
+        )
+        return self

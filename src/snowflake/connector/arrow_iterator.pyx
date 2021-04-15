@@ -4,6 +4,7 @@
 
 # distutils: language = c++
 # cython: language_level=3
+from typing import Iterator
 
 from cpython.ref cimport PyObject
 from libc.stdint cimport *
@@ -168,8 +169,14 @@ cdef class PyArrowIterator(EmptyPyArrowIterator):
     # https://docs.snowflake.com/en/user-guide/sqlalchemy.html#numpy-data-type-support
     cdef object use_numpy
 
-    def __cinit__(self, object cursor, object py_inputstream, object arrow_context, object use_dict_result,
-                  object numpy):
+    def __cinit__(
+            self,
+            object cursor,
+            object py_inputstream,
+            object arrow_context,
+            object use_dict_result,
+            object numpy,
+    ):
         cdef shared_ptr[InputStream] input_stream
         cdef shared_ptr[CRecordBatch] record_batch
         cdef CStatus ret
@@ -177,11 +184,11 @@ cdef class PyArrowIterator(EmptyPyArrowIterator):
         cdef CResult[shared_ptr[CRecordBatchReader]] readerRet = CRecordBatchStreamReader.Open(input_stream.get())
         if not readerRet.ok():
             Error.errorhandler_wrapper(
-                cursor.connection,
+                cursor.connection if cursor is not None else None,
                 cursor,
                 OperationalError,
                 {
-                    'msg': 'Failed to open arrow stream: ' + str(readerRet.status().message()),
+                    'msg': f'Failed to open arrow stream: {readerRet.status().message()}',
                     'errno': ER_FAILED_TO_READ_ARROW_STREAM
                 })
 
@@ -191,20 +198,21 @@ cdef class PyArrowIterator(EmptyPyArrowIterator):
             ret = reader.get().ReadNext(&record_batch)
             if not ret.ok():
                 Error.errorhandler_wrapper(
-                    cursor.connection,
+                    cursor.connection if cursor is not None else None,
                     cursor,
                     OperationalError,
                     {
-                        'msg': 'Failed to read next arrow batch: ' + str(ret.message()),
+                        'msg': f'Failed to read next arrow batch: {ret.message()}',
                         'errno': ER_FAILED_TO_READ_ARROW_STREAM
-                    })
+                    }
+                )
 
             if record_batch.get() is NULL:
                 break
 
             self.batches.push_back(record_batch)
 
-        snow_logger.debug(msg="Batches read: {}".format(self.batches.size()), path_name=__file__, func_name="__cinit__")
+        snow_logger.debug(msg=f"Batches read: {self.batches.size()}", path_name=__file__, func_name="__cinit__")
 
         self.context = arrow_context
         self.cIterator = NULL
@@ -216,16 +224,22 @@ cdef class PyArrowIterator(EmptyPyArrowIterator):
     def __dealloc__(self):
         del self.cIterator
 
+    def __iter__(self):
+        return self
+
     def __next__(self):
         self.cret = self.cIterator.next()
 
         if not self.cret.get().successObj:
-            msg = 'Failed to convert current row, cause: ' + str(<object>self.cret.get().exception)
-            Error.errorhandler_wrapper(self.cursor.connection, self.cursor, InterfaceError,
-                                       {
-                                           'msg': msg,
-                                           'errno': ER_FAILED_TO_CONVERT_ROW_TO_PYTHON_TYPE
-                                       })
+            Error.errorhandler_wrapper(
+                self.cursor.connection if self.cursor is not None else None,
+                self.cursor,
+                InterfaceError,
+                {
+                    'msg': f'Failed to convert current row, cause: {<object>self.cret.get().exception}',
+                    'errno': ER_FAILED_TO_CONVERT_ROW_TO_PYTHON_TYPE
+                }
+            )
             # it looks like this line can help us get into python and detect the global variable immediately
             # however, this log will not show up for unclear reason
         ret = <object>self.cret.get().successObj
